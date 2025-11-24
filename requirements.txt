@@ -1,5 +1,8 @@
 streamlit
-joblib
-scikit-learn
 numpy
 pandas
+joblib
+scikit-learn
+huggingface-hub
+tensorflow
+requests
