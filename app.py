@@ -12,8 +12,9 @@ from typing import Any, Dict, List
 # ----------------- Configuration -----------------
 st.set_page_config(page_title="Lung Cancer Checker (Streamlit)", layout="centered")
 
-# Path to parameter image that you uploaded (already present in environment)
-PARAMETERS_IMAGE_PATH = "/mnt/data/da734b7e-2a46-40b4-bf67-b5b5adb501fc.png"
+# Developer-supplied sample image path (you uploaded this earlier)
+# We'll use this as the optional sample image in Doctor mode.
+SAMPLE_IMAGE_PATH = "/mnt/data/da734b7e-2a46-40b4-bf67-b5b5adb501fc.png"
 
 # Feature order expected by the model (must match model training)
 FEATURE_ORDER = [
@@ -36,7 +37,7 @@ FEATURE_ORDER = [
 # SQLite DB for doctor history
 DB_PATH = "predictions.db"
 
-# ----------------- Helpers: DB -----------------
+# ----------------- DB helpers -----------------
 def init_db(path: str = DB_PATH):
     conn = sqlite3.connect(path, check_same_thread=False)
     cur = conn.cursor()
@@ -73,7 +74,7 @@ def delete_record(record_id: int):
     cur.execute("DELETE FROM predictions WHERE id = ?", (int(record_id),))
     DB_CONN.commit()
 
-# ----------------- Helpers: UI inputs -----------------
+# ----------------- UI helpers -----------------
 def binary_select(label: str, key: str, default: int = 0) -> int:
     """Render a Yes/No select and return 0/1."""
     return int(st.selectbox(label, options=[0, 1], format_func=lambda x: "No" if x == 0 else "Yes", index=default, key=key))
@@ -81,7 +82,6 @@ def binary_select(label: str, key: str, default: int = 0) -> int:
 def assemble_inputs(prefix: str) -> Dict[str, int]:
     """Render inputs for all features (except computed) and compute the derived feature."""
     inputs = {}
-    # Render fields in same order used previously (excluding the computed field)
     inputs["SMOKING"] = binary_select("Smoking (Do you smoke?)", prefix + "SMOKING")
     inputs["YELLOW_FINGERS"] = binary_select("Yellow fingers (Do you have yellowish fingers?)", prefix + "YELLOW_FINGERS")
     inputs["ANXIETY"] = binary_select("Anxiety (Do you frequently feel anxious?)", prefix + "ANXIETY")
@@ -100,20 +100,15 @@ def assemble_inputs(prefix: str) -> Dict[str, int]:
     inputs["ANXIETY_PLUS_YELLOWFINGERS"] = 1 if (inputs["ANXIETY"] == 1 and inputs["YELLOW_FINGERS"] == 1) else 0
     return inputs
 
-# ----------------- Helpers: Remote inference -----------------
-# 1) Put these two secrets in Streamlit Cloud (Settings → Secrets):
-#    HF_INFERENCE_URL  (e.g. https://api-inference.huggingface.co/models/username/repo)
-#    HF_TOKEN          (only if your model/prediction endpoint requires authentication)
+# ----------------- Remote inference helpers -----------------
 HF_INFERENCE_URL = st.secrets.get("HF_INFERENCE_URL") or os.environ.get("HF_INFERENCE_URL")
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN")
-# Optional DOCTOR_PASSWORD secret override
 DOCTOR_PASSWORD_SECRET = st.secrets.get("DOCTOR_PASSWORD") or os.environ.get("DOCTOR_PASSWORD", "doctor123")
 
 def call_hf_inference(feature_vector: List[int]) -> Any:
     """
-    Call remote inference endpoint. By default uses HF Inference API style endpoint.
-    Payload: {"inputs": feature_vector}
-    Returns the JSON response from the remote endpoint.
+    Call remote inference endpoint (Hugging Face Inference API or custom endpoint).
+    Default payload: {"inputs": feature_vector}
     """
     if not HF_INFERENCE_URL:
         raise RuntimeError("HF_INFERENCE_URL is not configured. Set the secret on Streamlit Cloud.")
@@ -127,29 +122,20 @@ def call_hf_inference(feature_vector: List[int]) -> Any:
 
 def parse_remote_result(result_json: Any) -> Dict[str, Any]:
     """
-    Attempt to parse common HF/endpoint responses into {'prediction': 0|1, 'probability': float|None}.
-    The remote API may return:
-      - list of dicts [{'label': '0' or '1', 'score': 0.7}, ...]
-      - dict with {'label': 'LABEL', 'score': ...}
-      - dict with {'pred': 0, 'prob': 0.7} (custom)
-      - any structure: we try to find numeric score/label heuristically
+    Parse common result shapes into {'prediction': 0|1 or None, 'probability': float or None, 'raw': ...}
     """
     pred = None
     prob = None
 
-    # If result is a list with label/score
+    # 1) List of dicts (common HF format)
     try:
         if isinstance(result_json, list) and len(result_json) > 0 and isinstance(result_json[0], dict):
-            # choose the best entry if multiple
             entry = result_json[0]
-            # label may be 'LABEL_0' or 'NEGATIVE' or '0'
             if "label" in entry:
                 label = entry.get("label")
-                # try find numeric in label
                 try:
                     pred = int("".join(ch for ch in str(label) if ch.isdigit()))
                 except Exception:
-                    # if label is 'POSITIVE' or 'NEGATIVE'
                     label_str = str(label).lower()
                     if "pos" in label_str or "positive" in label_str:
                         pred = 1
@@ -157,73 +143,69 @@ def parse_remote_result(result_json: Any) -> Dict[str, Any]:
                         pred = 0
             if "score" in entry:
                 prob = float(entry.get("score"))
-            # fallback: if no label but 'score' present and only one output, interpret score threshold 0.5
             if pred is None and prob is not None:
                 pred = 1 if prob >= 0.5 else 0
-            return {"prediction": pred, "probability": prob}
+            return {"prediction": pred, "probability": prob, "raw": result_json}
     except Exception:
         pass
 
-    # If result is a dict
+    # 2) Dict with common keys
     if isinstance(result_json, dict):
-        # common custom shapes
         if "pred" in result_json and "prob" in result_json:
             try:
-                pred = int(result_json["pred"])
-                prob = float(result_json["prob"])
-                return {"prediction": pred, "probability": prob}
+                return {"prediction": int(result_json["pred"]), "probability": float(result_json["prob"]), "raw": result_json}
             except Exception:
                 pass
         if "prediction" in result_json and "probability" in result_json:
             try:
-                return {"prediction": int(result_json["prediction"]), "probability": float(result_json["probability"])}
+                return {"prediction": int(result_json["prediction"]), "probability": float(result_json["probability"]), "raw": result_json}
             except Exception:
                 pass
-        # If label & score top-level
         if "label" in result_json and "score" in result_json:
             label = result_json["label"]
             try:
-                pred = int("".join(ch for ch in str(label) if ch.isdigit()))
+                p = int("".join(ch for ch in str(label) if ch.isdigit()))
+                prob = float(result_json["score"])
+                return {"prediction": p, "probability": prob, "raw": result_json}
             except Exception:
                 label_str = str(label).lower()
                 if "pos" in label_str:
                     pred = 1
                 elif "neg" in label_str:
                     pred = 0
-            prob = float(result_json["score"])
-            if pred is None and prob is not None:
-                pred = 1 if prob >= 0.5 else 0
-            return {"prediction": pred, "probability": prob}
+                prob = float(result_json["score"])
+                if pred is None and prob is not None:
+                    pred = 1 if prob >= 0.5 else 0
+                return {"prediction": pred, "probability": prob, "raw": result_json}
 
-    # As a last resort, try to find any float in the returned JSON and treat as prob
+    # 3) Fallback: search for a floating number in the JSON and treat it as probability
     try:
         text = json.dumps(result_json)
-        # find numbers like 0.123
         import re
         m = re.search(r"0?\.\d+", text)
         if m:
             prob = float(m.group(0))
             pred = 1 if prob >= 0.5 else 0
-            return {"prediction": pred, "probability": prob}
+            return {"prediction": pred, "probability": prob, "raw": result_json}
     except Exception:
         pass
 
-    # Unknown structure: return the raw result in 'raw' and prediction as None
+    # Unknown structure
     return {"prediction": None, "probability": None, "raw": result_json}
 
 # ----------------- App UI -----------------
 st.title("Lung Cancer Checker — Patient & Doctor (Streamlit)")
 
-if os.path.exists(PARAMETERS_IMAGE_PATH):
-    st.sidebar.image(PARAMETERS_IMAGE_PATH, caption="Model parameters (source image)", use_column_width=True)
+# Show sample parameter image in sidebar if available
+if os.path.exists(SAMPLE_IMAGE_PATH):
+    st.sidebar.image(SAMPLE_IMAGE_PATH, caption="Model parameters (developer sample)", use_column_width=True)
 else:
-    st.sidebar.write("Parameters image not found.")
+    st.sidebar.write("Developer parameter image not found.")
 
 st.sidebar.markdown("---")
-st.sidebar.write("Remote inference endpoint:" if HF_INFERENCE_URL else "No HF inference URL set. Set HF_INFERENCE_URL in Streamlit secrets.")
+st.sidebar.write("Remote inference endpoint configured." if HF_INFERENCE_URL else "HF_INFERENCE_URL not set. Add it to Streamlit secrets.")
 if HF_INFERENCE_URL:
-    st.sidebar.write(HF_INFERENCE_URL if len(HF_INFERENCE_URL) < 60 else HF_INFERENCE_URL[:60] + "...")
-st.sidebar.markdown("---")
+    st.sidebar.write(HF_INFERENCE_URL if len(HF_INFERENCE_URL) < 80 else HF_INFERENCE_URL[:80] + "...")
 
 mode = st.sidebar.radio("Select mode", ["Patient", "Doctor"])
 
@@ -231,18 +213,18 @@ mode = st.sidebar.radio("Select mode", ["Patient", "Doctor"])
 if mode == "Patient":
     st.header("Patient mode — Enter your details")
     st.write("Fill the form and press **Predict**. The derived feature `ANXIETY_PLUS_YELLOWFINGERS` is computed automatically.")
+
     with st.form("patient_form"):
         patient_inputs = assemble_inputs(prefix="p_")
         submitted = st.form_submit_button("Predict")
+
     if submitted:
-        # Prepare feature vector in FEATURE_ORDER
         feature_list = [int(patient_inputs.get(f, 0)) for f in FEATURE_ORDER]
         st.write("Feature vector sent (in model feature order):")
         st.json({f: patient_inputs.get(f, 0) for f in FEATURE_ORDER})
         try:
             result = call_hf_inference(feature_list)
             parsed = parse_remote_result(result)
-            # Show results
             if parsed.get("prediction") is not None:
                 pred_text = "Positive (model class=1)" if parsed["prediction"] == 1 else "Negative (model class=0)"
                 st.success(f"Prediction: {pred_text}")
@@ -255,42 +237,91 @@ if mode == "Patient":
         except Exception as e:
             st.error(f"Error calling remote inference: {e}")
 
-# ----------------- Doctor mode -----------------
+# ----------------- Doctor mode (image-based) -----------------
 elif mode == "Doctor":
-    st.header("Doctor mode — (protected)")
-    # Simple password gate (demo). For production use proper auth.
+    st.header("Doctor mode — Image-based prediction (protected)")
+
     supplied_pwd = st.text_input("Doctor password", type="password")
     expected_pwd = DOCTOR_PASSWORD_SECRET or "doctor123"
     if supplied_pwd != expected_pwd:
         st.warning("Doctor mode requires a password. Provide the correct password to proceed.")
         st.stop()
 
-    st.success("Authenticated (demo). You may run predictions and manage saved records.")
+    st.success("Authenticated (demo). Use the controls below to upload an image or use the sample image for prediction.")
 
-    # Run a prediction for a patient
-    with st.form("doctor_predict"):
-        doc_inputs = assemble_inputs(prefix="d_")
-        save_after = st.checkbox("Save this prediction to history", value=True)
-        run = st.form_submit_button("Run prediction")
-    if run:
-        feature_list = [int(doc_inputs.get(f, 0)) for f in FEATURE_ORDER]
-        st.write("Feature vector sent:")
-        st.json({f: doc_inputs.get(f, 0) for f in FEATURE_ORDER})
-        try:
-            result = call_hf_inference(feature_list)
-            parsed = parse_remote_result(result)
-            if parsed.get("prediction") is not None:
-                st.info(f"Prediction: {'Positive' if parsed['prediction'] == 1 else 'Negative'}")
-            if parsed.get("probability") is not None:
-                st.info(f"Probability (class=1): {parsed['probability']:.4f}")
-            st.subheader("Remote (raw) response")
-            st.json(result)
-            if save_after:
-                # save using the parsed prediction/prob (or None)
-                save_record({k: doc_inputs.get(k, 0) for k in FEATURE_ORDER}, parsed.get("prediction") if parsed.get("prediction") is not None else -1, parsed.get("probability"))
-                st.success("Saved record to history.")
-        except Exception as e:
-            st.error(f"Error calling remote inference: {e}")
+    st.markdown("**Use developer sample image**")
+    use_sample = st.button("Use developer sample image")
+
+    uploaded_file = st.file_uploader("Upload patient image (png/jpg). The image will be sent to the remote model for prediction.", type=["png", "jpg", "jpeg"])
+
+    image_bytes = None
+    image_name = None
+    image_mime = None
+
+    if use_sample:
+        if os.path.exists(SAMPLE_IMAGE_PATH):
+            with open(SAMPLE_IMAGE_PATH, "rb") as f:
+                image_bytes = f.read()
+            image_name = os.path.basename(SAMPLE_IMAGE_PATH)
+            image_mime = "image/png" if image_name.lower().endswith(".png") else "image/jpeg"
+            st.image(SAMPLE_IMAGE_PATH, caption="Sample image (developer)", use_column_width=True)
+        else:
+            st.error("Sample image not present at expected path.")
+
+    if uploaded_file is not None:
+        image_bytes = uploaded_file.read()
+        image_name = uploaded_file.name
+        image_mime = uploaded_file.type or ("image/png" if image_name.lower().endswith(".png") else "image/jpeg")
+        st.image(image_bytes, caption=f"Uploaded: {image_name}", use_column_width=True)
+
+    if st.button("Send image to model for prediction"):
+        if image_bytes is None:
+            st.error("No image selected. Upload an image or click 'Use developer sample image'.")
+        else:
+            if not HF_INFERENCE_URL:
+                st.error("HF_INFERENCE_URL not configured. Add it to Streamlit secrets.")
+            else:
+                try:
+                    headers = {}
+                    if HF_TOKEN:
+                        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+                    # Try multipart/form-data upload first
+                    files = {"file": (image_name or "image.png", image_bytes, image_mime or "image/png")}
+                    try:
+                        resp = requests.post(HF_INFERENCE_URL, headers=headers, files=files, timeout=120)
+                        resp.raise_for_status()
+                        remote_result = resp.json()
+                    except Exception as e_mult:
+                        # Fallback: send raw bytes
+                        try:
+                            resp = requests.post(HF_INFERENCE_URL, headers=headers, data=image_bytes, timeout=120)
+                            resp.raise_for_status()
+                            remote_result = resp.json()
+                        except Exception as e_raw:
+                            raise RuntimeError(f"Upload failed (multipart error: {e_mult}; raw post error: {e_raw})")
+
+                    st.subheader("Remote model raw response")
+                    st.json(remote_result)
+
+                    parsed = parse_remote_result(remote_result)
+                    if parsed.get("prediction") is not None:
+                        st.success(f"Prediction: {'Positive' if parsed['prediction'] == 1 else 'Negative'}")
+                    else:
+                        st.info("Prediction could not be parsed automatically from the remote response.")
+                    if parsed.get("probability") is not None:
+                        st.info(f"Probability (class=1): {parsed['probability']:.4f}")
+
+                    if st.checkbox("Save this result to history", value=True):
+                        save_record(
+                            input_dict={"image": image_name or "uploaded"},
+                            prediction=parsed.get("prediction") if parsed.get("prediction") is not None else -1,
+                            probability=parsed.get("probability")
+                        )
+                        st.success("Saved record to history (image name stored).")
+
+                except Exception as e:
+                    st.error(f"Error sending image to remote inference: {e}")
 
     st.markdown("---")
     st.subheader("Saved predictions (history)")
@@ -300,7 +331,6 @@ elif mode == "Doctor":
         st.info("No saved predictions yet.")
     else:
         st.dataframe(df)
-        # Delete a record
         with st.form("delete_record"):
             del_id = st.number_input("Enter record id to delete", min_value=0, value=0, step=1)
             del_submit = st.form_submit_button("Delete record")
@@ -309,7 +339,6 @@ elif mode == "Doctor":
             st.success(f"Deleted record {del_id}.")
             st.experimental_rerun()
 
-        # Export CSV
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
 
